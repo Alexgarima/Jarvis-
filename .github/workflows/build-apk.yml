@@ -1,0 +1,130 @@
+name: Build and Publish Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies & Build Web App
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Verify Java environment
+        run: |
+          java -version
+          echo "JAVA_HOME: $JAVA_HOME"
+          JAVA_MAJOR=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | awk -F '.' '{print $1}')
+          echo "Detected Java Major Version: $JAVA_MAJOR"
+          if [ "$JAVA_MAJOR" -lt 17 ]; then
+            echo "Error: Java version must be 17 or higher"
+            exit 1
+          fi
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android Project via Capacitor
+        run: |
+          npm install --no-save @capacitor/core @capacitor/cli @capacitor/android
+          npx cap init "JARVIS AI Assistant" "com.jarvis.assistant" --web-dir dist
+          npx cap add android
+          npx cap copy android
+
+      - name: Create temporary debug keystore
+        run: |
+          if [ ! -f ./debug.keystore ]; then
+            keytool -genkey -v -keystore ./debug.keystore -alias androiddebugkey -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          test -f ./debug.keystore || (echo "Failed to create debug keystore" && exit 1)
+
+      - name: Build Android Debug APK
+        working-directory: ./android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Verify the APK
+        id: verify-apk
+        run: |
+          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK_PATH" ]; then
+            echo "Searching for APK in android/app/build/outputs..."
+            find android/app/build/outputs -name "*.apk"
+            echo "Error: app-debug.apk not found at $APK_PATH"
+            exit 1
+          fi
+          echo "Verified APK at $APK_PATH"
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Prepare APK release asset
+        id: prep-asset
+        run: |
+          mkdir -p /tmp/apk-release
+          REPO_CLEAN=$(echo "${{ github.repository }}" | sed 's/[^a-zA-Z0-9_-]/-/g')
+          RELEASE_ASSET_NAME="${REPO_CLEAN}-debug-build-${{ github.run_number }}.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk /tmp/apk-release/${RELEASE_ASSET_NAME}
+          echo "asset_path=/tmp/apk-release/${RELEASE_ASSET_NAME}" >> $GITHUB_OUTPUT
+          echo "asset_name=${RELEASE_ASSET_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Publish APK to GitHub Releases
+        id: create-release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh --version
+          TAG_NAME="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
+          gh release create "$TAG_NAME" "${{ steps.prep-asset.outputs.asset_path }}" \
+            --title "Debug APK Build #${{ github.run_number }}" \
+            --target "${{ github.sha }}" \
+            --latest \
+            --notes "### 🚀 Automatically Generated Debug APK
+- **Workflow Run**: #${{ github.run_number }} (Attempt ${{ github.run_attempt }})
+- **Commit SHA**: \`${{ github.sha }}\`
+- **Application**: JARVIS AI Assistant
+- **Note**: This APK was automatically compiled by GitHub Actions and is signed with a temporary debug keystore for personal use and testing."
+
+      - name: Report APK download result
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.create-release.outcome }}" = "success" ]; then
+            TAG_NAME="debug-apk-build-${{ github.run_number }}-${{ github.run_attempt }}"
+            echo "### ✅ APK Build & Release Succeeded!" >> $GITHUB_STEP_SUMMARY
+            echo "Release Tag: \`$TAG_NAME\`" >> $GITHUB_STEP_SUMMARY
+            echo "APK Asset: \`${{ steps.prep-asset.outputs.asset_name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "[Open GitHub Release](https://github.com/${{ github.repository }}/releases/tag/$TAG_NAME)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ℹ️ APK built successfully! Artifact is available as 'app-debug-apk'." >> $GITHUB_STEP_SUMMARY
+          fi

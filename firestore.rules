@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+             data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'createdAt', 'lastLoginAt']) &&
+             data.uid is string && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 256 &&
+             (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128)) &&
+             (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 1024)) &&
+             (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 128)) &&
+             (!('lastLoginAt' in data) || (data.lastLoginAt is string && data.lastLoginAt.size() <= 128));
+    }
+
+    function isValidUserHistory(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'prompt', 'spokenResponse', 'createdAt']) &&
+             data.keys().hasOnly(['id', 'userId', 'prompt', 'spokenResponse', 'actionType', 'createdAt']) &&
+             data.id is string && data.id.size() <= 128 &&
+             data.userId == userId &&
+             data.prompt is string && data.prompt.size() <= 1000 &&
+             data.spokenResponse is string && data.spokenResponse.size() <= 2000 &&
+             (!('actionType' in data) || (data.actionType is string && data.actionType.size() <= 64)) &&
+             data.createdAt is string && data.createdAt.size() <= 128;
+    }
+
+    // Connection test document
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // User profile documents
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId) && isOwner(userId) && incoming().uid == userId && isValidUserProfile(incoming());
+      allow update: if isValidId(userId) && isOwner(userId) && incoming().uid == existing().uid && isValidUserProfile(incoming());
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      // User command and conversation history subcollection
+      match /history/{historyId} {
+        allow get, list: if isValidId(userId) && isOwner(userId);
+        allow create: if isValidId(userId) && isOwner(userId) && isValidId(historyId) && isValidUserHistory(incoming(), userId);
+        allow delete: if isValidId(userId) && isOwner(userId) && isValidId(historyId);
+        allow update: if false;
+      }
+    }
+  }
+}
